@@ -1,22 +1,26 @@
 # -*- coding:utf-8 -*-
 # Created Time: 六 12/30 13:49:21 2017
 # Author: Taihong Xiao <xiaotaihong@126.com>
-
-import numpy as np
-import time
-import os, glob, shutil
-import cv2
 import argparse
+import os
+import socket
+import struct
+import time
+
+import cv2
+import numpy as np
 import tensorflow as tf
+
 from model import JumpModel
 from model_fine import JumpModelFine
+
 
 def multi_scale_search(pivot, screen, range=0.3, num=10):
     H, W = screen.shape[:2]
     h, w = pivot.shape[:2]
 
     found = None
-    for scale in np.linspace(1-range, 1+range, num)[::-1]:
+    for scale in np.linspace(1 - range, 1 + range, num)[::-1]:
         resized = cv2.resize(screen, (int(W * scale), int(H * scale)))
         r = W / float(resized.shape[1])
         if resized.shape[0] < h or resized.shape[1] < w:
@@ -29,11 +33,88 @@ def multi_scale_search(pivot, screen, range=0.3, num=10):
         if found is None or res.max() > found[-1]:
             found = (pos_h, pos_w, r, res.max())
 
-    if found is None: return (0,0,0,0,0)
+    if found is None: return (0, 0, 0, 0, 0)
     pos_h, pos_w, r, score = found
     start_h, start_w = int(pos_h * r), int(pos_w * r)
     end_h, end_w = int((pos_h + h) * r), int((pos_w + w) * r)
     return [start_h, start_w, end_h, end_w, score]
+
+
+class AdbException(Exception):
+    def __init__(self, message, id):
+        message = '%s (id=%s)' % (message.strip(), id)
+        Exception.__init__(self, message)
+
+
+class adb:
+    def __init__(self, id):
+        self.id = id
+        self.s = socket.socket()
+        self.s.settimeout(5.0)
+        self.s.connect(('127.0.0.1', 5037))
+        self.xfer('host:transport-any' if id is None else
+                  ('host:transport:%s' % id))
+
+    def close(self):
+        self.s.close()
+
+    def xfer(self, command):
+        self.s.sendall('%04x%s' % (len(command), command))
+        result = self.s.recv(4)
+        if result == 'OKAY':
+            return self
+        if result == 'FAIL':
+            raise AdbException('error: ' + self.s.recv(
+                int(self.s.recv(4), 16)), self.id)
+        raise AdbException('FAIL: %s' % repr(result), self.id)
+
+    def read(self, n):
+        b = ''
+        while len(b) < n:
+            _ = self.s.recv(n - len(b))
+            if len(_) is 0:
+                self.s.close()
+                break
+            b += _
+        return b
+
+
+def screenshot(id):
+    """ Take a screen shot, saving it to 'filename' """
+    stream = adb(id).xfer('framebuffer:')
+    version = struct.unpack('<I', stream.read(4))[0]
+    if version == 16:
+        # Cupcake-style, without a header
+        bpp = version
+        size, width, height = struct.unpack('<3I', stream.read(12))
+        r_off, r_len, g_off, g_len, b_off, b_len, a_off, a_len = 11, 5, 5, 6, 0, 5, 0, 0
+    elif version == 1:
+        bpp, size, width, height, r_off, r_len, g_off, g_len, b_off, b_len, a_off, a_len = struct.unpack('<12I',
+                                                                                                         stream.read(
+                                                                                                             48))
+    else:
+        raise Exception('Unsupported DDMS_RAWINFO_VERSION: %d' % version)
+    data = stream.read(size)
+    stream.close()
+
+    is_bgr = (r_off > b_off)
+
+    try:
+        """ PIL has problems parsing these BMPs, so we can't just do:
+                import PIL.ImageFile
+                p=PIL.ImageFile.Parser()
+                p.feed(BMP+DIB+data)
+                p.close().save(filename)
+        """
+        import PIL.Image
+        modes = ({16: ('BGR;16'), 24: ('BGR'), 32: ('BGRX')} if is_bgr else
+                 {16: ('RGB;16'), 24: ('RGB'), 32: ('RGBX')})
+        return PIL.Image.fromstring('RGB', (width, height), data,
+                                    'raw', modes[bpp])
+    except ImportError:
+        raise Exception(
+            'a.device.screenshot requires the PIL module to save to this format on this device. Please download and install PIL from http://www.pythonware.com/products/pil/')
+
 
 class WechatAutoJump(object):
     def __init__(self, phone, sensitivity, serverURL, debug, resource_dir):
@@ -80,23 +161,20 @@ class WechatAutoJump(object):
 
     def get_current_state(self):
         if self.phone == 'Android':
-            os.system('adb shell screencap -p /sdcard/1.png')
-            os.system('adb pull /sdcard/1.png state.png')
-        elif self.phone == 'IOS':
+            pil_image = screenshot(None)
+            state = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        else:
             self.client.screenshot('state.png')
-        if not os.path.exists('state.png'):
-            raise NameError('Cannot obtain screenshot from your phone! Please follow the instructions in readme!')
+            state = cv2.imread('state.png')
+        # if self.debug:
+        #     shutil.copyfile('state.png', os.path.join(self.debug, 'state_{:03d}.png'.format(self.step)))
 
-        if self.debug:
-            shutil.copyfile('state.png', os.path.join(self.debug, 'state_{:03d}.png'.format(self.step)))
-
-        state = cv2.imread('state.png')
         self.resolution = state.shape[:2]
         scale = state.shape[1] / 720.
         state = cv2.resize(state, (720, int(state.shape[0] / scale)), interpolation=cv2.INTER_NEAREST)
         if state.shape[0] > 1280:
             s = (state.shape[0] - 1280) // 2
-            state = state[s:(s+1280),:,:]
+            state = state[s:(s + 1280), :, :]
         elif state.shape[0] < 1280:
             s1 = (1280 - state.shape[0]) // 2
             s2 = (1280 - state.shape[0]) - s1
@@ -108,7 +186,7 @@ class WechatAutoJump(object):
     def get_player_position(self, state):
         state = cv2.cvtColor(state, cv2.COLOR_BGR2GRAY)
         pos = multi_scale_search(self.player, state, 0.3, 10)
-        h, w = int((pos[0] + 13 * pos[2])/14.), (pos[1] + pos[3])//2
+        h, w = int((pos[0] + 13 * pos[2]) / 14.), (pos[1] + pos[3]) // 2
         return np.array([h, w])
 
     def get_target_position(self, state, player_pos):
@@ -141,7 +219,7 @@ class WechatAutoJump(object):
         return out
 
     def get_target_position_fast(self, state, player_pos):
-        state_cut = state[:player_pos[0],:,:]
+        state_cut = state[:player_pos[0], :, :]
         m1 = (state_cut[:, :, 0] == 245)
         m2 = (state_cut[:, :, 1] == 245)
         m3 = (state_cut[:, :, 2] == 245)
@@ -158,7 +236,7 @@ class WechatAutoJump(object):
         distance = np.linalg.norm(player_pos - target_pos)
         press_time = distance * self.sensitivity
         press_time = int(np.rint(press_time))
-        press_h, press_w = int(0.82*self.resolution[0]), self.resolution[1]//2
+        press_h, press_w = int(0.82 * self.resolution[0]), self.resolution[1] // 2
         if self.phone == 'Android':
             cmd = 'adb shell input swipe {} {} {} {} {}'.format(press_w, press_h, press_w, press_h, press_time)
             print(cmd)
@@ -168,9 +246,11 @@ class WechatAutoJump(object):
 
     def debugging(self):
         current_state = self.state.copy()
-        cv2.circle(current_state, (self.player_pos[1], self.player_pos[0]), 5, (0,255,0), -1)
-        cv2.circle(current_state, (self.target_pos[1], self.target_pos[0]), 5, (0,0,255), -1)
-        cv2.imwrite(os.path.join(self.debug, 'state_{:03d}_res_h_{}_w_{}.png'.format(self.step, self.target_pos[0], self.target_pos[1])), current_state)
+        cv2.circle(current_state, (self.player_pos[1], self.player_pos[0]), 5, (0, 255, 0), -1)
+        cv2.circle(current_state, (self.target_pos[1], self.target_pos[0]), 5, (0, 0, 255), -1)
+        cv2.imwrite(os.path.join(self.debug, 'state_{:03d}_res_h_{}_w_{}.png'.format(self.step, self.target_pos[0],
+                                                                                     self.target_pos[1])),
+                    current_state)
 
     def play(self):
         self.state = self.get_current_state()
@@ -196,7 +276,8 @@ class WechatAutoJump(object):
             while True:
                 self.play()
         except KeyboardInterrupt:
-                pass
+            pass
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -204,7 +285,8 @@ if __name__ == "__main__":
     parser.add_argument('--sensitivity', default=2.045, type=float, help='constant for press time')
     parser.add_argument('--serverURL', default='http://localhost:8100', type=str, help='ServerURL for wda Client')
     parser.add_argument('--resource', default='resource', type=str, help='resource dir')
-    parser.add_argument('--debug', default=None, type=str, help='debug mode, specify a directory for storing log files.')
+    parser.add_argument('--debug', default=None, type=str,
+                        help='debug mode, specify a directory for storing log files.')
     args = parser.parse_args()
     # print(args)
 
