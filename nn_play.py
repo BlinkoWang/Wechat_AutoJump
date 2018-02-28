@@ -109,7 +109,7 @@ def screenshot(id):
         import PIL.Image
         modes = ({16: ('BGR;16'), 24: ('BGR'), 32: ('BGRX')} if is_bgr else
                  {16: ('RGB;16'), 24: ('RGB'), 32: ('RGBX')})
-        return PIL.Image.fromstring('RGB', (width, height), data,
+        return PIL.Image.frombytes('RGB', (width, height), data,
                                     'raw', modes[bpp])
     except ImportError:
         raise Exception(
